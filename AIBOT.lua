@@ -1,4 +1,3 @@
-
 -- =========================================
 -- FIXED ULTRA-SMART AI BOT - Proper Learning & No Spinning
 -- =========================================
@@ -383,28 +382,36 @@ end
 local function executeAction(action, lidarData)
 	local moveVector = Vector3.zero
 	local turnMultiplier = 0
+	local moveSpeed = 1
 	
 	if action == "forward" then
 		moveVector = rootPart.CFrame.LookVector
 		turnMultiplier = 0
+		moveSpeed = 1
 	elseif action == "forward_left" then
 		moveVector = rootPart.CFrame.LookVector
 		turnMultiplier = -0.5
+		moveSpeed = 0.9
 	elseif action == "forward_right" then
 		moveVector = rootPart.CFrame.LookVector
 		turnMultiplier = 0.5
+		moveSpeed = 0.9
 	elseif action == "sharp_left" then
 		moveVector = rootPart.CFrame.LookVector * 0.5
 		turnMultiplier = -1.5
+		moveSpeed = 0.6
 	elseif action == "sharp_right" then
 		moveVector = rootPart.CFrame.LookVector * 0.5
 		turnMultiplier = 1.5
+		moveSpeed = 0.6
 	elseif action == "backup_left" then
 		moveVector = -rootPart.CFrame.LookVector * 0.7
 		turnMultiplier = -1
+		moveSpeed = 0.5
 	elseif action == "backup_right" then
 		moveVector = -rootPart.CFrame.LookVector * 0.7
 		turnMultiplier = 1
+		moveSpeed = 0.5
 	end
 	
 	-- Apply turn
@@ -412,6 +419,9 @@ local function executeAction(action, lidarData)
 		local turnAngle = turnMultiplier * CONFIG.TURN_SPEED
 		rootPart.CFrame = rootPart.CFrame * CFrame.Angles(0, turnAngle, 0)
 	end
+	
+	-- Set WalkSpeed based on action
+	humanoid.WalkSpeed = CONFIG.MOVEMENT_SPEED * moveSpeed
 	
 	-- Move
 	humanoid:Move(moveVector)
@@ -645,6 +655,142 @@ RunService.Heartbeat:Connect(function(deltaTime)
 	
 	-- Update Q-value
 	if botControl.lastState and botControl.lastAction then
+		updateQValue(botControl.lastState, botControl.lastAction, reward, currentState)
+	end
+	
+	-- Save state and action for next iteration
+	botControl.lastState = currentState
+	botControl.lastAction = action
+	
+	-- Track unique states learned
+	if qTable[currentState] then
+		statesLearned = 0
+		for _ in pairs(qTable) do
+			statesLearned = statesLearned + 1
+		end
+	end
+	
+	-- Decay exploration rate
+	botControl.explorationRate = math.max(
+		CONFIG.MIN_EXPLORATION,
+		botControl.explorationRate * CONFIG.EXPLORATION_DECAY
+	)
+	
+	-- Update confidence levels
+	if reward > 0 then
+		botControl.toolUseConfidence = math.min(1, botControl.toolUseConfidence + 0.01)
+		botControl.clickConfidence = math.min(1, botControl.clickConfidence + 0.01)
+		botControl.successfulMoves = botControl.successfulMoves + 1
+	else
+		botControl.toolUseConfidence = math.max(0, botControl.toolUseConfidence - 0.005)
+		botControl.clickConfidence = math.max(0, botControl.clickConfidence - 0.005)
+		botControl.failedMoves = botControl.failedMoves + 1
+	end
+	
+	-- Update status
+	if botControl.escapeMode then
+		botControl.status = "ESCAPING"
+	elseif interactionSuccess then
+		botControl.status = "COLLECTING"
+	elseif lidarData.hasPlayers then
+		botControl.status = "PLAYER DETECTED"
+	elseif lidarData.hasDanger then
+		botControl.status = "DANGER NEARBY"
+	elseif botControl.isMoving then
+		botControl.status = "NAVIGATING"
+	else
+		botControl.status = "THINKING"
+	end
+	
+	-- Debug info (every 2 seconds)
+	if currentTime - lastUpdate > 2 then
+		local successRate = botControl.successfulMoves / math.max(1, botControl.successfulMoves + botControl.failedMoves) * 100
+		print(string.format("🤖 %s | Coins: %d | Score: %d | Moving: %s", 
+			botControl.status, botControl.coinsCollected, botControl.score, 
+			botControl.isMoving and "YES" or "NO"))
+		print(string.format("📊 States: %d | Success: %.1f%% | Explore: %.2f | Tool: %.2f", 
+			statesLearned, successRate, botControl.explorationRate, botControl.toolUseConfidence))
+		
+		if lidarSystem.nearestObstacle then
+			print(string.format("🚧 Nearest: %s (%s) at %.1fm | ID: %s", 
+				lidarSystem.nearestObstacle.name,
+				lidarSystem.nearestObstacle.type,
+				lidarSystem.nearestObstacle.distance,
+				lidarSystem.nearestObstacle.id:sub(1, 25)))
+		end
+		
+		if lidarSystem.nearestPlayer then
+			print(string.format("👤 Player: %s (ID: %s) at %.1fm", 
+				lidarSystem.nearestPlayer.name,
+				lidarSystem.nearestPlayer.id,
+				lidarSystem.nearestPlayer.distance))
+		end
+		
+		if botControl.lastDamageSource and tick() - botControl.lastDamageTime < 10 then
+			local dangerObj = botControl.dangerousObjects[botControl.lastDamageSource]
+			if dangerObj then
+				print(string.format("⚠️ Last damage from: %s (-%d HP)", 
+					dangerObj.name, dangerObj.damage))
+			end
+		end
+		
+		-- Show detected objects summary
+		local objectCounts = {obstacles = 0, players = 0, interactables = 0, dangers = 0}
+		for _, detection in ipairs(lidarSystem.allDetections) do
+			if detection.isPlayer then
+				objectCounts.players = objectCounts.players + 1
+			elseif detection.isDangerous then
+				objectCounts.dangers = objectCounts.dangers + 1
+			elseif detection.isInteractive then
+				objectCounts.interactables = objectCounts.interactables + 1
+			elseif detection.type == "Obstacle" or detection.type == "Solid" then
+				objectCounts.obstacles = objectCounts.obstacles + 1
+			end
+		end
+		
+		print(string.format("🔍 Detected: %d obstacles, %d players, %d items, %d dangers",
+			objectCounts.obstacles, objectCounts.players, 
+			objectCounts.interactables, objectCounts.dangers))
+		
+		print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+		
+		lastUpdate = currentTime
+	end
+end)
+
+-- ================= CLEANUP OLD DATA =================
+task.spawn(function()
+	while true do
+		task.wait(30)
+		
+		-- Clean up old dangerous objects
+		local now = tick()
+		for id, obj in pairs(botControl.dangerousObjects) do
+			if now - obj.lastSeen > CONFIG.DAMAGE_MEMORY_DURATION then
+				botControl.dangerousObjects[id] = nil
+			end
+		end
+		
+		-- Clean up old player data
+		for userId, playerData in pairs(botControl.nearbyPlayers) do
+			if now - playerData.lastSeen > 30 then
+				botControl.nearbyPlayers[userId] = nil
+			end
+		end
+	end
+end)
+
+print("✅ ULTRA-SMART AI BOT INITIALIZED")
+print("Features:")
+print("  • 17 LiDAR beams (7 forward, 5 below, 5 behind)")
+print("  • 360° awareness with object identification")
+print("  • Player detection with name & ID tracking")
+print("  • Damage source identification & memory")
+print("  • Tool usage with confidence threshold")
+print("  • Smart rewards: +5 moving, -1 standing, -3 collision")
+print("  • 11 movement actions including strafing & circling")
+print("Press 'P' to toggle AI control")
+print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 		updateQValue(botControl.lastState, botControl.lastAction, reward, currentState)
 	end
 	
