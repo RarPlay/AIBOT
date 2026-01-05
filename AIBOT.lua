@@ -294,8 +294,25 @@ function UIManager.new()
 	actionLabel.TextXAlignment = Enum.TextXAlignment.Left
 	actionLabel.Parent = screenGui
 	
+	-- AI Response label
+	local responseLabel = Instance.new("TextLabel")
+	responseLabel.Name = "ResponseLabel"
+	responseLabel.Size = UDim2.new(0, 400, 0, 200)
+	responseLabel.Position = UDim2.new(0, 10, 0, 230)
+	responseLabel.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+	responseLabel.BorderColor3 = Color3.fromRGB(255, 150, 0)
+	responseLabel.BorderSizePixel = 2
+	responseLabel.TextColor3 = Color3.fromRGB(255, 200, 0)
+	responseLabel.TextSize = 13
+	responseLabel.Font = Enum.Font.Gotham
+	responseLabel.TextWrapped = true
+	responseLabel.TextXAlignment = Enum.TextXAlignment.Left
+	responseLabel.TextYAlignment = Enum.TextYAlignment.Top
+	responseLabel.Parent = screenGui
+	
 	self.statusLabel = statusLabel
 	self.actionLabel = actionLabel
+	self.responseLabel = responseLabel
 	self.screenGui = screenGui
 	
 	return self
@@ -311,6 +328,72 @@ end
 
 function UIManager:updateAction(actionStr)
 	self.actionLabel.Text = "Action: " .. actionStr
+end
+
+function UIManager:updateResponse(response)
+	if response and response ~= "" then
+		self.responseLabel.Text = "AI: " .. response
+	end
+end
+
+-- ===================== TEXT INPUT HANDLER =====================
+local TextInputHandler = {}
+TextInputHandler.__index = TextInputHandler
+
+function TextInputHandler.new(network)
+	local self = setmetatable({}, TextInputHandler)
+	self.network = network
+	self.userInput = game:GetService("UserInputService")
+	self.currentText = ""
+	
+	return self
+end
+
+function TextInputHandler:listenForInput()
+	-- Listen for chat messages or text input
+	self.userInput.InputBegan:Connect(function(input, gameProcessed)
+		if gameProcessed then return end
+		
+		if input.KeyCode == Enum.KeyCode.T then
+			-- Open text input
+			local textBox = Instance.new("TextBox")
+			textBox.Name = "AIInputBox"
+			textBox.Size = UDim2.new(0, 400, 0, 40)
+			textBox.Position = UDim2.new(0.5, -200, 1, -100)
+			textBox.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+			textBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+			textBox.TextSize = 14
+			textBox.Font = Enum.Font.Gotham
+			textBox.BorderColor3 = Color3.fromRGB(100, 200, 255)
+			textBox.BorderSizePixel = 2
+			textBox.PlaceholderText = "Ask AI something... (Press Enter to send)"
+			textBox.Parent = player:WaitForChild("PlayerGui")
+			
+			textBox:CaptureFocus()
+			
+			local submitted = false
+			textBox.FocusLost:Connect(function(enterPressed)
+				if enterPressed and textBox.Text ~= "" then
+					submitted = true
+					self:sendMessage(textBox.Text)
+				end
+				textBox:Destroy()
+			end)
+		end
+	end)
+end
+
+function TextInputHandler:sendMessage(message)
+	if self.network.connected then
+		local payload = {
+			type = "text_message",
+			message = message,
+			timestamp = tick()
+		}
+		
+		table.insert(self.network.messageQueue, payload)
+		print("[Text Input] Sent to AI: " .. message)
+	end
 end
 
 -- ===================== BATCH MANAGER =====================
@@ -346,6 +429,7 @@ function Controller.new()
 	self.ui = UIManager.new()
 	self.network = WebSocketClient.new(CONFIG.serverUrl)
 	self.batchManager = BatchManager.new(0.1)
+	self.textInput = TextInputHandler.new(self.network)
 	
 	self.isRunning = true
 	self.frameCount = 0
@@ -372,6 +456,7 @@ function Controller:update()
 	
 	-- Create message for batching
 	local message = {
+		type = "sensor_data",
 		sensors = sensorData,
 		state = playerState,
 		timestamp = tick()
@@ -388,6 +473,11 @@ function Controller:update()
 			-- Apply last action from batch
 			self.executor:execute(response.actions)
 			self.network.totalScore = response.score or 0
+			
+			-- Display AI response if present
+			if response.ai_response then
+				self.ui:updateResponse(response.ai_response)
+			end
 		end
 		
 		self.totalBatched = self.totalBatched + self.network.queueSize
@@ -425,6 +515,10 @@ function Controller:start()
 		return
 	end
 	
+	-- Start listening for text input
+	self.textInput:listenForInput()
+	print("[NN Client] Press 'T' to chat with AI")
+	
 	-- Main loop
 	local lastUpdate = tick()
 	
@@ -446,6 +540,27 @@ end
 function Controller:stop()
 	self.isRunning = false
 	self.network:disconnect()
+	
+	-- Save model before exit
+	local savePayload = {
+		type = "save_model",
+		timestamp = tick()
+	}
+	
+	local success, response = pcall(function()
+		return HttpService:PostAsync(
+			"http://localhost:5000/batch",
+			HttpService:JSONEncode({messages = {savePayload}}),
+			Enum.HttpContentType.ApplicationJson
+		)
+	end)
+	
+	if success then
+		print("[NN Client] Model saved successfully")
+	else
+		print("[NN Client] Warning: Could not save model")
+	end
+	
 	print("[NN Client] Stopped")
 end
 
