@@ -1,805 +1,421 @@
--- =========================================
--- ULTRA-SMART AI BOT - FIXED & IMPROVED
--- =========================================
 
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local Workspace = game:GetService("Workspace")
-local UserInputService = game:GetService("UserInputService")
-local player = Players.LocalPlayer
+-- Roblox RLUA Neural Network Client
+-- Communicates with Python server at localhost:5000 (100 Hz)
+-- Handles LiDAR sensing, player state, and action execution
 
--- ================= CONFIGURATION =================
-local CONFIG = {
-	MOVEMENT_SPEED = 16,
-	TURN_SPEED = 0.12,
-	SAFE_DISTANCE = 10,
-	DANGER_DISTANCE = 5,
-	RAYCAST_DISTANCE = 40,
-	MIN_MOVEMENT_SPEED = 1.5,
-	STUCK_THRESHOLD = 3,
-	STUCK_CHECK_TIME = 2,
-	INTERACTION_DISTANCE = 12,
-	PLAYER_DETECTION_DISTANCE = 60,
-	LIDAR_UPDATE_INTERVAL = 0.08,
-	LEARNING_RATE = 0.2,
-	DISCOUNT_FACTOR = 0.85,
-	EXPLORATION_RATE = 0.4,
-	EXPLORATION_DECAY = 0.9985,
-	MIN_EXPLORATION = 0.05,
-	TOOL_USE_COOLDOWN = 0.3,
-	DAMAGE_MEMORY_DURATION = 90,
-	POSITION_MEMORY = 20,
-	MAX_TURN_PER_TICK = 0.25
-}
-
-local INTERACTIVE_TAGS = {"Coin", "Collectible", "Button", "Door", "Chest", "Item", "Tool", "Weapon", "Pickup"}
-local OBSTACLE_TAGS = {"Wall", "Barrier", "Obstacle", "Block"}
-local DANGEROUS_TAGS = {"Spike", "Lava", "Trap", "Danger", "Kill", "Damage", "Hazard"}
-
--- ================= BOT STATE =================
-local botControl = {
-	enabled = true,
-	status = "INITIALIZING",
-	score = 0,
-	coinsCollected = 0,
-	distanceTraveled = 0,
-	lastPosition = nil,
-	lastMovementTime = tick(),
-	lastMoveDistance = 0,
-	currentPosition = Vector3.zero,
-	positionHistory = {},
-	visitedPositions = {},
-	successfulMoves = 0,
-	failedMoves = 0,
-	lastAction = nil,
-	lastState = nil,
-	escapeMode = false,
-	escapeStartTime = 0,
-	escapeDirection = nil,
-	explorationRate = CONFIG.EXPLORATION_RATE,
-	isMoving = false,
-	actualVelocity = 0,
-	stuckCounter = 0,
-	lastStuckCheck = 0,
-	forceForwardCounter = 0,
-	
-	-- Damage tracking
-	lastHealth = 100,
-	dangerousObjects = {},
-	lastDamageSource = nil,
-	lastDamageTime = 0,
-	totalDamageTaken = 0,
-	recentDamagePositions = {},
-	
-	-- Player tracking
-	nearbyPlayers = {},
-	rememberedPlayers = {},
-	
-	-- Object memory
-	rememberedObjects = {},
-	interactionAttempts = {},
-	
-	-- Tool usage
-	currentTool = nil,
-	toolUseConfidence = 0,
-	lastToolUse = 0,
-	
-	-- Performance
-	tickCount = 0,
-	avgTickTime = 0
-}
-
--- ================= LIDAR SYSTEM =================
-local lidarSystem = {
-	forward = {},
-	below = {},
-	behind = {},
-	sides = {},
-	allDetections = {},
-	nearestObstacle = nil,
-	nearestPlayer = nil,
-	nearestInteractable = nil,
-	pathClear = true,
-	dangerAhead = false
-}
-
--- ================= Q-LEARNING =================
-local qTable = {}
-local actionList = {
-	"forward",
-	"forward_left", 
-	"forward_right",
-	"sharp_left",
-	"sharp_right",
-	"back_left",
-	"back_right",
-	"strafe_left",
-	"strafe_right",
-	"slow_forward",
-	"emergency_back"
-}
-
--- ================= CHARACTER SETUP =================
+local player = game.Players.LocalPlayer
 local character = player.Character or player.CharacterAdded:Wait()
 local humanoid = character:WaitForChild("Humanoid")
 local rootPart = character:WaitForChild("HumanoidRootPart")
 
-botControl.lastPosition = rootPart.Position
-botControl.currentPosition = rootPart.Position
-botControl.lastHealth = humanoid.Health
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
 
-print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-print("🧠 ULTRA-SMART AI BOT - FIXED VERSION")
-print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+-- ===================== CONFIG =====================
+local CONFIG = {
+	serverUrl = "http://localhost:5000",
+	updateRate = 100, -- Hz (10ms per update)
+	lidarRange = 100,
+	lidarSamples = 5, -- forward, left, right, down, player detection
+	debugMode = true
+}
 
-humanoid.WalkSpeed = CONFIG.MOVEMENT_SPEED
-humanoid.JumpPower = 0
-humanoid.AutoRotate = false
+-- Track timing
+local lastUpdateTime = tick()
+local updateInterval = 1 / CONFIG.updateRate
+local frameCount = 0
+local failedRequests = 0
 
--- ================= INPUT BLOCKING =================
-local function blockPlayerInput()
-	UserInputService.ModalEnabled = true
+-- ===================== LIDAR SENSOR =====================
+local LidarSensor = {}
+LidarSensor.__index = LidarSensor
+
+function LidarSensor.new(rootPart, range)
+	local self = setmetatable({}, LidarSensor)
+	self.rootPart = rootPart
+	self.range = range
+	return self
 end
 
-local function restorePlayerInput()
-	UserInputService.ModalEnabled = false
-	humanoid.AutoRotate = true
-	humanoid.JumpPower = 50
-end
-
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
-	if gameProcessed then return end
-	if input.KeyCode == Enum.KeyCode.P then
-		botControl.enabled = not botControl.enabled
-		if botControl.enabled then
-			print("🤖 AI CONTROL: ENABLED")
-			blockPlayerInput()
-		else
-			print("👤 PLAYER CONTROL: ENABLED")
-			restorePlayerInput()
-			humanoid:Move(Vector3.zero)
-		end
-	elseif input.KeyCode == Enum.KeyCode.R and botControl.enabled then
-		-- Reset learning
-		qTable = {}
-		botControl.explorationRate = CONFIG.EXPLORATION_RATE
-		print("🔄 Q-Table reset! Starting fresh learning.")
-	end
-end)
-
-blockPlayerInput()
-
--- ================= DAMAGE TRACKING =================
-humanoid.HealthChanged:Connect(function(health)
-	if health < botControl.lastHealth then
-		local damage = botControl.lastHealth - health
-		botControl.lastDamageTime = tick()
-		botControl.totalDamageTaken = botControl.totalDamageTaken + damage
-		
-		-- Record damage position
-		table.insert(botControl.recentDamagePositions, {
-			position = rootPart.Position,
-			time = tick(),
-			damage = damage
-		})
-		
-		-- Keep only recent damage positions
-		if #botControl.recentDamagePositions > 10 then
-			table.remove(botControl.recentDamagePositions, 1)
-		end
-		
-		-- Try to identify damage source
-		local touchingParts = rootPart:GetTouchingParts()
-		local foundSource = false
-		
-		for _, part in ipairs(touchingParts) do
-			local isDangerous = false
-			
-			-- Check tags
-			for _, tag in ipairs(DANGEROUS_TAGS) do
-				if part:HasTag(tag) or part.Name:lower():find(tag:lower()) then
-					isDangerous = true
-					break
-				end
-			end
-			
-			if isDangerous then
-				local id = tostring(part:GetFullName())
-				
-				if not botControl.dangerousObjects[id] then
-					botControl.dangerousObjects[id] = {
-						name = part.Name,
-						position = part.Position,
-						damage = damage,
-						lastSeen = tick(),
-						timesHit = 1,
-						instance = part
-					}
-				else
-					botControl.dangerousObjects[id].damage = botControl.dangerousObjects[id].damage + damage
-					botControl.dangerousObjects[id].timesHit = botControl.dangerousObjects[id].timesHit + 1
-					botControl.dangerousObjects[id].lastSeen = tick()
-				end
-				
-				botControl.lastDamageSource = id
-				foundSource = true
-				
-				print(string.format("⚠️ DAMAGE: -%d HP from '%s' (Hit #%d)", 
-					damage, part.Name, botControl.dangerousObjects[id].timesHit))
-				
-				-- Enter escape mode with direction away from danger
-				botControl.escapeMode = true
-				botControl.escapeStartTime = tick()
-				botControl.escapeDirection = (rootPart.Position - part.Position).Unit
-				
-				break
-			end
-		end
-		
-		-- Check nearby players
-		for _, otherPlayer in ipairs(Players:GetPlayers()) do
-			if otherPlayer ~= player and otherPlayer.Character then
-				local otherRoot = otherPlayer.Character:FindFirstChild("HumanoidRootPart")
-				if otherRoot and (otherRoot.Position - rootPart.Position).Magnitude < 25 then
-					local userId = tostring(otherPlayer.UserId)
-					
-					if botControl.nearbyPlayers[userId] then
-						botControl.nearbyPlayers[userId].hostile = true
-						botControl.nearbyPlayers[userId].damageDealt = 
-							(botControl.nearbyPlayers[userId].damageDealt or 0) + damage
-					end
-					
-					botControl.rememberedPlayers[userId] = {
-						name = otherPlayer.Name,
-						hostile = true,
-						lastSeen = tick(),
-						damageDealt = (botControl.rememberedPlayers[userId] and 
-							botControl.rememberedPlayers[userId].damageDealt or 0) + damage,
-						encounters = (botControl.rememberedPlayers[userId] and 
-							botControl.rememberedPlayers[userId].encounters or 0) + 1
-					}
-					
-					if not foundSource then
-						print(string.format("🎯 DAMAGE: Possible attacker '%s' - MARKED HOSTILE", 
-							otherPlayer.Name))
-						foundSource = true
-					end
-				end
-			end
-		end
-		
-		if not foundSource then
-			print(string.format("⚠️ DAMAGE: -%d HP from UNKNOWN source", damage))
-		end
-	end
-	botControl.lastHealth = health
-end)
-
--- ================= RAYCAST SETUP =================
-local rayParams = RaycastParams.new()
-rayParams.FilterType = Enum.RaycastFilterType.Exclude
-
-local function updateRaycastFilter()
-	rayParams.FilterDescendantsInstances = {character}
-end
-updateRaycastFilter()
-
--- ================= OBJECT IDENTIFICATION =================
-local function identifyObject(hit)
-	local info = {
-		type = "Unknown",
-		name = hit.Name,
-		id = tostring(hit:GetFullName()),
-		isDangerous = false,
-		isInteractive = false,
-		isPlayer = false,
-		distance = 0,
-		priority = 0
-	}
+function LidarSensor:castRay(direction, range)
+	if not self.rootPart then return range end
 	
-	-- Check if player
-	local humanoidCheck = hit.Parent and hit.Parent:FindFirstChild("Humanoid")
-	if humanoidCheck and hit.Parent ~= character then
-		local playerCheck = Players:GetPlayerFromCharacter(hit.Parent)
-		if playerCheck then
-			info.isPlayer = true
-			info.type = "Player"
-			info.name = playerCheck.Name
-			info.id = tostring(playerCheck.UserId)
-			info.priority = 5
-			return info
-		end
-	end
+	local rayOrigin = self.rootPart.Position
+	local rayDirection = direction * range
 	
-	-- Check dangerous (highest priority)
-	for _, tag in ipairs(DANGEROUS_TAGS) do
-		if hit:HasTag(tag) or hit.Name:lower():find(tag:lower()) then
-			info.isDangerous = true
-			info.type = "Danger"
-			info.priority = 10
-			return info
-		end
-	end
+	local raycastParams = RaycastParams.new()
+	raycastParams:AddToFilter(self.rootPart.Parent)
+	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
 	
-	-- Check if remembered dangerous object
-	if botControl.dangerousObjects[info.id] then
-		info.isDangerous = true
-		info.type = "RememberedDanger"
-		info.priority = 9
-		return info
-	end
+	local result = workspace:Raycast(rayOrigin, rayDirection, raycastParams)
 	
-	-- Check interactive
-	for _, tag in ipairs(INTERACTIVE_TAGS) do
-		if hit:HasTag(tag) or hit.Name:lower():find(tag:lower()) then
-			info.isInteractive = true
-			info.type = tag
-			info.priority = 7
-			return info
-		end
-	end
-	
-	-- Check obstacles
-	for _, tag in ipairs(OBSTACLE_TAGS) do
-		if hit:HasTag(tag) or hit.Name:lower():find(tag:lower()) then
-			info.type = "Obstacle"
-			info.priority = 3
-			return info
-		end
-	end
-	
-	if hit:IsA("BasePart") and hit.CanCollide then
-		info.type = "Solid"
-		info.priority = 2
+	if result then
+		return (result.Position - rayOrigin).Magnitude
 	else
-		info.type = "Empty"
-		info.priority = 0
+		return range
 	end
-	
-	return info
 end
 
--- ================= ADVANCED LIDAR SYSTEM =================
-local function performFullLiDARScan()
-	local origin = rootPart.Position + Vector3.new(0, 2, 0)
-	local lookDir = rootPart.CFrame.LookVector
-	local rightDir = rootPart.CFrame.RightVector
-	
-	lidarSystem.allDetections = {}
-	local allObstacles = {}
-	local allPlayers = {}
-	local allInteractables = {}
-	local allDangers = {}
-	
-	-- FORWARD BEAMS (9 beams for better coverage)
-	lidarSystem.forward = {}
-	local forwardAngles = {-1.4, -1.0, -0.6, -0.3, 0, 0.3, 0.6, 1.0, 1.4}
-	for i, angle in ipairs(forwardAngles) do
-		local rotatedDir = CFrame.fromAxisAngle(Vector3.new(0, 1, 0), angle) * lookDir
-		local rayDirection = rotatedDir.Unit * CONFIG.RAYCAST_DISTANCE
-		
-		local success, rayResult = pcall(function()
-			return Workspace:Raycast(origin, rayDirection, rayParams)
-		end)
-		
-		local beamData = {
-			direction = "forward",
-			angle = math.deg(angle),
-			distance = CONFIG.RAYCAST_DISTANCE,
-			hit = false
-		}
-		
-		if success and rayResult then
-			local objInfo = identifyObject(rayResult.Instance)
-			objInfo.distance = rayResult.Distance
-			objInfo.position = rayResult.Position
-			
-			beamData.distance = rayResult.Distance
-			beamData.hit = true
-			beamData.object = objInfo
-			
-			table.insert(lidarSystem.allDetections, objInfo)
-			
-			if objInfo.isDangerous then
-				table.insert(allDangers, objInfo)
-			elseif objInfo.isPlayer then
-				table.insert(allPlayers, objInfo)
-			elseif objInfo.isInteractive then
-				table.insert(allInteractables, objInfo)
-			elseif objInfo.type ~= "Empty" then
-				table.insert(allObstacles, objInfo)
-			end
-		end
-		
-		lidarSystem.forward[i] = beamData
+function LidarSensor:sense()
+	if not self.rootPart then
+		return {0.5, 0.5, 0.5, 0.5, 0.5}
 	end
 	
-	-- SIDE BEAMS (left and right)
-	lidarSystem.sides = {}
-	local sideAngles = {-1.57, 1.57}  -- 90° left and right
-	for i, angle in ipairs(sideAngles) do
-		local rotatedDir = CFrame.fromAxisAngle(Vector3.new(0, 1, 0), angle) * lookDir
-		local rayDirection = rotatedDir.Unit * (CONFIG.RAYCAST_DISTANCE * 0.6)
-		
-		local success, rayResult = pcall(function()
-			return Workspace:Raycast(origin, rayDirection, rayParams)
-		end)
-		
-		local beamData = {
-			direction = angle < 0 and "left" or "right",
-			distance = CONFIG.RAYCAST_DISTANCE * 0.6,
-			hit = false
-		}
-		
-		if success and rayResult then
-			local objInfo = identifyObject(rayResult.Instance)
-			objInfo.distance = rayResult.Distance
-			objInfo.position = rayResult.Position
-			
-			beamData.distance = rayResult.Distance
-			beamData.hit = true
-			beamData.object = objInfo
-			
-			table.insert(lidarSystem.allDetections, objInfo)
-			
-			if objInfo.isDangerous then
-				table.insert(allDangers, objInfo)
-			end
-		end
-		
-		lidarSystem.sides[i] = beamData
+	local cf = self.rootPart.CFrame
+	
+	-- Cast rays in 5 directions
+	local forward = self:castRay(cf.LookVector, self.range)
+	local left = self:castRay(-cf.RightVector, self.range)
+	local right = self:castRay(cf.RightVector, self.range)
+	local down = self:castRay(-Vector3.new(0, 1, 0), self.range)
+	local playerDist = 0.5 -- Placeholder
+	
+	-- Normalize to [0, 1]
+	forward = math.min(forward / self.range, 1)
+	left = math.min(left / self.range, 1)
+	right = math.min(right / self.range, 1)
+	down = math.min(down / self.range, 1)
+	
+	return {forward, left, right, down, playerDist}
+end
+
+-- ===================== PLAYER STATE =====================
+local function getPlayerState()
+	if not character or not humanoid or not rootPart then
+		return nil
 	end
 	
-	-- BELOW BEAMS (ground check)
-	lidarSystem.below = {}
-	local belowOrigin = rootPart.Position + Vector3.new(0, 1, 0)
-	local belowAngles = {-0.5, -0.25, 0, 0.25, 0.5}
-	for i, angle in ipairs(belowAngles) do
-		local horizontalDir = CFrame.fromAxisAngle(Vector3.new(0, 1, 0), angle) * lookDir
-		local rayDirection = (horizontalDir - Vector3.new(0, 1.5, 0)).Unit * 8
-		
-		local success, rayResult = pcall(function()
-			return Workspace:Raycast(belowOrigin, rayDirection, rayParams)
-		end)
-		
-		local beamData = {
-			direction = "below",
-			angle = math.deg(angle),
-			distance = 8,
-			hit = false
-		}
-		
-		if success and rayResult then
-			local objInfo = identifyObject(rayResult.Instance)
-			objInfo.distance = rayResult.Distance
-			
-			beamData.distance = rayResult.Distance
-			beamData.hit = true
-			beamData.object = objInfo
-			
-			if objInfo.isDangerous then
-				table.insert(allDangers, objInfo)
-			end
-		end
-		
-		lidarSystem.below[i] = beamData
-	end
+	local pos = rootPart.Position
+	local vel = rootPart.AssemblyLinearVelocity
 	
-	-- BEHIND BEAMS (rear awareness)
-	lidarSystem.behind = {}
-	local behindAngles = {-2.8, -2.4, 3.14159, 2.4, 2.8}
-	for i, angle in ipairs(behindAngles) do
-		local rotatedDir = CFrame.fromAxisAngle(Vector3.new(0, 1, 0), angle) * lookDir
-		local rayDirection = rotatedDir.Unit * (CONFIG.RAYCAST_DISTANCE * 0.5)
-		
-		local success, rayResult = pcall(function()
-			return Workspace:Raycast(origin, rayDirection, rayParams)
-		end)
-		
-		local beamData = {
-			direction = "behind",
-			angle = math.deg(angle),
-			distance = CONFIG.RAYCAST_DISTANCE * 0.5,
-			hit = false
-		}
-		
-		if success and rayResult then
-			local objInfo = identifyObject(rayResult.Instance)
-			objInfo.distance = rayResult.Distance
-			
-			beamData.distance = rayResult.Distance
-			beamData.hit = true
-			beamData.object = objInfo
-			
-			if objInfo.isPlayer then
-				table.insert(allPlayers, objInfo)
-			end
-		end
-		
-		lidarSystem.behind[i] = beamData
-	end
+	-- Get nearby parts/objects
+	local touchingParts = {}
+	local region = Region3.new(pos - Vector3.new(20, 20, 20), pos + Vector3.new(20, 20, 20))
+	region = region:ExpandToGrid(4)
 	
-	-- Sphere-based player detection
-	for _, otherPlayer in ipairs(Players:GetPlayers()) do
-		if otherPlayer ~= player and otherPlayer.Character then
-			local otherRoot = otherPlayer.Character:FindFirstChild("HumanoidRootPart")
-			if otherRoot then
-				local distance = (otherRoot.Position - rootPart.Position).Magnitude
-				if distance < CONFIG.PLAYER_DETECTION_DISTANCE then
-					local userId = tostring(otherPlayer.UserId)
-					local isHostile = botControl.rememberedPlayers[userId] and 
-						botControl.rememberedPlayers[userId].hostile or false
-					
-					botControl.nearbyPlayers[userId] = {
-						name = otherPlayer.Name,
-						position = otherRoot.Position,
-						distance = distance,
-						lastSeen = tick(),
-						hostile = isHostile,
-						damageDealt = botControl.nearbyPlayers[userId] and 
-							botControl.nearbyPlayers[userId].damageDealt or 0
-					}
-					
-					if not botControl.rememberedPlayers[userId] then
-						botControl.rememberedPlayers[userId] = {
-							name = otherPlayer.Name,
-							hostile = false,
-							lastSeen = tick(),
-							encounters = 1,
-							damageDealt = 0
-						}
-					else
-						botControl.rememberedPlayers[userId].lastSeen = tick()
-					end
-				end
-			end
+	local parts = workspace:FindPartBoundsInRadius(pos, 30)
+	for _, part in ipairs(parts) do
+		if part.Parent ~= character and part ~= rootPart then
+			table.insert(touchingParts, {
+				name = part.Name,
+				distance = (part.Position - pos).Magnitude,
+				canTouch = part.CanCollide
+			})
 		end
 	end
-	
-	-- Find nearest of each type
-	lidarSystem.nearestObstacle = nil
-	lidarSystem.nearestPlayer = nil
-	lidarSystem.nearestInteractable = nil
-	
-	local minObstacleDist = math.huge
-	for _, obs in ipairs(allObstacles) do
-		if obs.distance < minObstacleDist then
-			minObstacleDist = obs.distance
-			lidarSystem.nearestObstacle = obs
-		end
-	end
-	
-	local minPlayerDist = math.huge
-	for _, plr in ipairs(allPlayers) do
-		if plr.distance < minPlayerDist then
-			minPlayerDist = plr.distance
-			lidarSystem.nearestPlayer = plr
-		end
-	end
-	
-	local minInteractDist = math.huge
-	for _, obj in ipairs(allInteractables) do
-		if obj.distance < minInteractDist then
-			minInteractDist = obj.distance
-			lidarSystem.nearestInteractable = obj
-		end
-	end
-	
-	-- Calculate summary metrics
-	local forwardDistances = {}
-	for _, beam in ipairs(lidarSystem.forward) do
-		table.insert(forwardDistances, beam.distance)
-	end
-	
-	local leftClear = (forwardDistances[1] + forwardDistances[2] + forwardDistances[3]) / 3 > CONFIG.SAFE_DISTANCE
-	local rightClear = (forwardDistances[7] + forwardDistances[8] + forwardDistances[9]) / 3 > CONFIG.SAFE_DISTANCE
-	local centerClear = forwardDistances[5] > CONFIG.SAFE_DISTANCE
-	
-	lidarSystem.pathClear = centerClear
-	lidarSystem.dangerAhead = #allDangers > 0 and allDangers[1].distance < CONFIG.DANGER_DISTANCE
 	
 	return {
-		forwardDistances = forwardDistances,
-		leftClear = leftClear,
-		rightClear = rightClear,
-		centerClear = centerClear,
-		minDistance = math.min(table.unpack(forwardDistances)),
-		hasPlayers = #allPlayers > 0,
-		hasInteractables = #allInteractables > 0,
-		hasDanger = #allDangers > 0,
-		nearestDangerDist = #allDangers > 0 and allDangers[1].distance or math.huge
+		position = {pos.X, pos.Y, pos.Z},
+		velocity = {vel.X, vel.Y, vel.Z},
+		health = humanoid.Health,
+		maxHealth = humanoid.MaxHealth,
+		humanoidState = humanoid:GetState().Name,
+		rotation = rootPart.Orientation.Y,
+		touchingParts = touchingParts,
+		isGrounded = humanoid:GetState() ~= Enum.HumanoidStateType.Freefall
 	}
 end
 
--- ================= MOVEMENT DETECTION =================
-local function getActualMovementSpeed()
-	local velocity = rootPart.AssemblyVelocity
-	local horizontalVelocity = Vector3.new(velocity.X, 0, velocity.Z)
-	botControl.actualVelocity = horizontalVelocity.Magnitude
-	return botControl.actualVelocity
+-- ===================== ACTION EXECUTOR =====================
+local ActionExecutor = {}
+ActionExecutor.__index = ActionExecutor
+
+function ActionExecutor.new(humanoid, rootPart)
+	local self = setmetatable({}, ActionExecutor)
+	self.humanoid = humanoid
+	self.rootPart = rootPart
+	self.currentAction = "IDLE"
+	return self
 end
 
-local function isActuallyMoving()
-	return botControl.actualVelocity > CONFIG.MIN_MOVEMENT_SPEED
-end
-
-local function checkIfStuck()
-	local now = tick()
-	if now - botControl.lastStuckCheck < CONFIG.STUCK_CHECK_TIME then
-		return botControl.stuckCounter > 0
+function ActionExecutor:execute(actions)
+	if not self.humanoid or self.humanoid.Health <= 0 then
+		return
 	end
 	
-	botControl.lastStuckCheck = now
+	-- Decode action values (expecting -1 to 1 range from Python)
+	local moveX = 0
+	local moveZ = 0
+	local shouldJump = false
+	local actionStr = ""
 	
-	if not isActuallyMoving() and botControl.lastAction and 
-	   (botControl.lastAction:find("forward") or botControl.lastAction:find("strafe")) then
-		botControl.stuckCounter = botControl.stuckCounter + 1
+	if actions.move_forward then
+		if actions.move_forward > 0.3 then
+			moveZ = -1
+			actionStr = actionStr .. "FWD "
+		elseif actions.move_forward < -0.3 then
+			moveZ = 1
+			actionStr = actionStr .. "BACK "
+		end
+	end
+	
+	if actions.move_left then
+		if actions.move_left > 0.3 then
+			moveX = -1
+			actionStr = actionStr .. "LEFT "
+		elseif actions.move_left < -0.3 then
+			moveX = 1
+			actionStr = actionStr .. "RIGHT "
+		end
+	end
+	
+	if actions.jump and actions.jump > 0.5 then
+		shouldJump = true
+		actionStr = actionStr .. "JUMP "
+	end
+	
+	-- Apply movement
+	self.humanoid:Move(Vector3.new(moveX, 0, moveZ), true)
+	
+	if shouldJump then
+		self.humanoid:Jump()
+	end
+	
+	self.currentAction = (actionStr ~= "" and string.sub(actionStr, 1, -2)) or "IDLE"
+end
+
+-- ===================== UI MANAGER =====================
+local UIManager = {}
+UIManager.__index = UIManager
+
+function UIManager.new()
+	local self = setmetatable({}, UIManager)
+	
+	local screenGui = Instance.new("ScreenGui")
+	screenGui.Name = "NNClientUI"
+	screenGui.ResetOnSpawn = false
+	screenGui.Parent = player:WaitForChild("PlayerGui")
+	
+	-- Status label
+	local statusLabel = Instance.new("TextLabel")
+	statusLabel.Name = "StatusLabel"
+	statusLabel.Size = UDim2.new(0, 400, 0, 120)
+	statusLabel.Position = UDim2.new(0, 10, 0, 10)
+	statusLabel.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+	statusLabel.BorderColor3 = Color3.fromRGB(0, 200, 0)
+	statusLabel.BorderSizePixel = 2
+	statusLabel.TextColor3 = Color3.fromRGB(0, 255, 0)
+	statusLabel.TextSize = 14
+	statusLabel.Font = Enum.Font.Courier
+	statusLabel.TextWrapped = true
+	statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+	statusLabel.TextYAlignment = Enum.TextYAlignment.Top
+	statusLabel.Parent = screenGui
+	
+	-- Action label
+	local actionLabel = Instance.new("TextLabel")
+	actionLabel.Name = "ActionLabel"
+	actionLabel.Size = UDim2.new(0, 400, 0, 60)
+	actionLabel.Position = UDim2.new(0, 10, 0, 140)
+	actionLabel.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+	actionLabel.BorderColor3 = Color3.fromRGB(100, 200, 255)
+	actionLabel.BorderSizePixel = 2
+	actionLabel.TextColor3 = Color3.fromRGB(100, 200, 255)
+	actionLabel.TextSize = 16
+	actionLabel.Font = Enum.Font.GothamBold
+	actionLabel.TextWrapped = true
+	statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+	actionLabel.Parent = screenGui
+	
+	self.statusLabel = statusLabel
+	self.actionLabel = actionLabel
+	self.screenGui = screenGui
+	
+	return self
+end
+
+function UIManager:updateStatus(fps, latency, failed, score)
+	local status = string.format(
+		"[NN CLIENT - Python Server]\n" ..
+		"FPS: %.1f | Latency: %.1fms\n" ..
+		"Failed Requests: %d\n" ..
+		"Score: %.1f\n" ..
+		"Server: localhost:5000",
+		fps, latency, failed, score
+	)
+	self.statusLabel.Text = status
+end
+
+function UIManager:updateAction(actionStr)
+	self.actionLabel.Text = "Action: " .. actionStr
+end
+
+-- ===================== NETWORK CLIENT =====================
+local NetworkClient = {}
+NetworkClient.__index = NetworkClient
+
+function NetworkClient.new(serverUrl)
+	local self = setmetatable({}, NetworkClient)
+	self.serverUrl = serverUrl
+	self.lastLatency = 0
+	self.totalScore = 0
+	self.connected = false
+	
+	return self
+end
+
+function NetworkClient:sendSensorData(sensorData, playerState)
+	local requestTime = tick()
+	
+	local payload = {
+		sensors = sensorData,
+		state = playerState,
+		timestamp = requestTime
+	}
+	
+	local success, response = pcall(function()
+		return HttpService:PostAsync(
+			self.serverUrl .. "/step",
+			HttpService:JSONEncode(payload),
+			Enum.HttpContentType.ApplicationJson,
+			false
+		)
+	end)
+	
+	if success then
+		self.lastLatency = (tick() - requestTime) * 1000
+		self.connected = true
+		
+		local decodedResponse = HttpService:JSONDecode(response)
+		return decodedResponse
 	else
-		botControl.stuckCounter = math.max(0, botControl.stuckCounter - 1)
+		failedRequests = failedRequests + 1
+		self.connected = false
+		return nil
 	end
-	
-	return botControl.stuckCounter >= CONFIG.STUCK_THRESHOLD
 end
 
--- ================= Q-LEARNING =================
-local function discretizeState(lidarData)
-	local function getBin(distance)
-		if distance < 5 then return "vclose"
-		elseif distance < 12 then return "close"
-		elseif distance < 20 then return "med"
-		else return "far"
+function NetworkClient:connect()
+	local success, response = pcall(function()
+		return HttpService:PostAsync(
+			self.serverUrl .. "/connect",
+			HttpService:JSONEncode({timestamp = tick()}),
+			Enum.HttpContentType.ApplicationJson,
+			false
+		)
+	end)
+	
+	if success then
+		self.connected = true
+		if CONFIG.debugMode then
+			print("[NN Client] Connected to Python server at " .. self.serverUrl)
 		end
-	end
-	
-	local left = getBin((lidarData.forwardDistances[1] + lidarData.forwardDistances[2]) / 2)
-	local center = getBin(lidarData.forwardDistances[5])
-	local right = getBin((lidarData.forwardDistances[8] + lidarData.forwardDistances[9]) / 2)
-	
-	local hasInteractable = lidarData.hasInteractables and "item" or "noitem"
-	local hasPlayer = lidarData.hasPlayers and "player" or "noplayer"
-	local hasDanger = lidarData.hasDanger and "danger" or "safe"
-	local moving = isActuallyMoving() and "moving" or "stuck"
-	local stuck = checkIfStuck() and "stuck" or "free"
-	
-	-- Check for hostile players
-	local hostileNearby = "nohostile"
-	for userId, playerData in pairs(botControl.nearbyPlayers) do
-		if playerData.hostile and playerData.distance < 30 then
-			hostileNearby = "hostile"
-			break
-		end
-	end
-	
-	-- Check escape mode
-	local escaping = botControl.escapeMode and "escape" or "normal"
-	
-	return string.format("%s_%s_%s_%s_%s_%s_%s_%s_%s_%s", 
-		left, center, right, hasInteractable, hasPlayer, hasDanger, 
-		moving, stuck, hostileNearby, escaping)
-end
-
-local function getQValue(state, action)
-	if not qTable[state] then qTable[state] = {} end
-	if not qTable[state][action] then qTable[state][action] = 0 end
-	return qTable[state][action]
-end
-
-local function getBestAction(state)
-	local bestAction = actionList[1]
-	local bestValue = getQValue(state, bestAction)
-	
-	for _, action in ipairs(actionList) do
-		local value = getQValue(state, action)
-		if value > bestValue then
-			bestValue = value
-			bestAction = action
-		end
-	end
-	
-	return bestAction, bestValue
-end
-
-local function chooseAction(state, lidarData)
-	-- Stuck detection - emergency actions
-	if checkIfStuck() then
-		botControl.forceForwardCounter = 0
-		local options = {"back_left", "back_right", "sharp_left", "sharp_right"}
-		return options[math.random(#options)]
-	end
-	
-	-- Force forward movement counter
-	if botControl.forceForwardCounter > 0 then
-		botControl.forceForwardCounter = botControl.forceForwardCounter - 1
-		if lidarData.centerClear then
-			return "forward"
-		else
-			return lidarData.leftClear and "forward_left" or "forward_right"
-		end
-	end
-	
-	-- If not moving for too long, force movement
-	if not isActuallyMoving() and tick() - botControl.lastMovementTime > 3 then
-		botControl.forceForwardCounter = 8
-		return "forward"
-	end
-	
-	-- Epsilon-greedy with forward bias
-	if math.random() < botControl.explorationRate then
-		-- Exploration - bias toward forward actions
-		if math.random() < 0.65 and lidarData.centerClear then
-			local forwardActions = {"forward", "forward_left", "forward_right", "slow_forward"}
-			return forwardActions[math.random(#forwardActions)]
-		else
-			return actionList[math.random(#actionList)]
-		end
+		return true
 	else
-		-- Exploitation
-		return getBestAction(state)
+		if CONFIG.debugMode then
+			print("[NN Client] Failed to connect to server: " .. tostring(response))
+		end
+		return false
 	end
 end
 
-local function updateQValue(state, action, reward, nextState)
-	local currentQ = getQValue(state, action)
-	local _, maxNextQ = getBestAction(nextState)
+-- ===================== MAIN CONTROLLER =====================
+local Controller = {}
+Controller.__index = Controller
+
+function Controller.new()
+	local self = setmetatable({}, Controller)
 	
-	local newQ = currentQ + CONFIG.LEARNING_RATE * 
-		(reward + CONFIG.DISCOUNT_FACTOR * maxNextQ - currentQ)
+	self.lidar = LidarSensor.new(rootPart, CONFIG.lidarRange)
+	self.executor = ActionExecutor.new(humanoid, rootPart)
+	self.ui = UIManager.new()
+	self.network = NetworkClient.new(CONFIG.serverUrl)
 	
-	if not qTable[state] then qTable[state] = {} end
-	qTable[state][action] = newQ
+	self.isRunning = true
+	self.frameCount = 0
+	self.lastFpsTime = tick()
+	self.currentFps = 0
+	
+	return self
 end
 
--- ================= ACTION EXECUTION =================
-local function executeAction(action, lidarData)
-	local moveVector = Vector3.zero
-	local turnAngle = 0
-	local moveSpeed = 1
-	
-	-- Action definitions
-	if action == "forward" then
-		moveVector = rootPart.CFrame.LookVector
-		turnAngle = 0
-		moveSpeed = 1
-	elseif action == "forward_left" then
-		moveVector = rootPart.CFrame.LookVector
-		turnAngle = -CONFIG.TURN_SPEED
-		moveSpeed = 0.9
-	elseif action == "forward_right" then
-		moveVector = rootPart.CFrame.LookVector
-		turnAngle = CONFIG.TURN_SPEED
-		moveSpeed = 0.9
-	elseif action == "sharp_left" then
-		moveVector = rootPart.CFrame.LookVector * 0.6
-		turnAngle = -CONFIG.TURN_SPEED * 1.8
-		moveSpeed = 0.6
-	elseif action == "sharp_right" then
-		moveVector = rootPart.CFrame.LookVector * 0.6
-		turnAngle = CONFIG.TURN_SPEED * 1.8
-		moveSpeed = 0.6
-	elseif action == "back_left" then
-		moveVector = -rootPart.CFrame.LookVector * 0.7
-		turnAngle = -CONFIG.TURN_SPEED
-		moveSpeed = 0.7
-	elseif action == "back_right" then
-		moveVector = -rootPart.CFrame.LookVector * 0.7
-		turnAngle = CONFIG.TURN_SPEED
-		moveSpeed = 0.7
-	elseif action == "strafe_left" then
-		moveVector = -rootPart.CFrame.RightVector
-		turnAngle = 0
-		moveSpeed = 0.75
-	elseif action == "strafe_right" then
-		moveVector = rootPart.CFrame.RightVector
-		turnAngle = 0
-		moveSpeed = 0.75
-	elseif action == "slow_forward" then
-		moveVector = rootPart.CFrame.LookVector
-		turnAngle = 0
-		moveSpeed = 0.5
-	elseif action == "emergency_back" then
-		moveVector = -rootPart.CFrame.LookVector
-		turnAngle = 0
-		moveSpeed = 1
+function Controller:update()
+	if not self.isRunning or not humanoid or humanoid.Health <= 0 then
+		return
 	end
 	
-	-- Normalize
+	-- Get sensor data
+	local sensorData = self.lidar:sense()
+	
+	-- Get player state
+	local playerState = getPlayerState()
+	if not playerState then
+		return
+	end
+	
+	-- Send to Python server and receive actions
+	local response = self.network:sendSensorData(sensorData, playerState)
+	
+	if response then
+		-- Execute actions from Python
+		self.executor:execute(response.actions or {})
+		self.network.totalScore = response.score or 0
+	end
+	
+	-- Update UI
+	self.frameCount = self.frameCount + 1
+	local currentTime = tick()
+	if currentTime - self.lastFpsTime >= 1 then
+		self.currentFps = self.frameCount
+		self.frameCount = 0
+		self.lastFpsTime = currentTime
+	end
+	
+	self.ui:updateStatus(self.currentFps, self.network.lastLatency, failedRequests, self.network.totalScore)
+	self.ui:updateAction(self.executor.currentAction)
+end
+
+function Controller:start()
+	print("[NN Client] Starting neural network client...")
+	
+	-- Try to connect to server
+	if not self.network:connect() then
+		self.ui:updateStatus(0, 0, 0, 0)
+		print("[NN Client] WARNING: Could not connect to Python server!")
+		return
+	end
+	
+	-- Main loop at 100 Hz
+	local lastUpdate = tick()
+	
+	local connection
+	connection = RunService.Heartbeat:Connect(function()
+		if not self.isRunning or not character or not humanoid or humanoid.Health <= 0 then
+			connection:Disconnect()
+			return
+		end
+		
+		local currentTime = tick()
+		if currentTime - lastUpdate >= updateInterval then
+			lastUpdate = currentTime
+			self:update()
+		end
+	end)
+end
+
+function Controller:stop()
+	self.isRunning = false
+	print("[NN Client] Stopped")
+end
+
+-- ===================== INITIALIZATION =====================
+local controller = Controller.new()
+controller:start()
+
+-- Handle character respawn
+player.CharacterAdded:Connect(function(newChar)
+	character = newChar
+	humanoid = character:WaitForChild("Humanoid")
+	rootPart = character:WaitForChild("HumanoidRootPart")
+	
+	controller.lidar.rootPart = rootPart
+	controller.executor.humanoid = humanoid
+	controller.executor.rootPart = rootPart
+	
+	print("[NN Client] Character respawned, resuming...")
+end)
+
+-- Cleanup
+game:BindToClose(function()
+	controller:stop()
+end)
