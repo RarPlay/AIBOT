@@ -196,7 +196,7 @@ function UIManager.new()
 	statusLabel.BorderSizePixel = 2
 	statusLabel.TextColor3 = Color3.fromRGB(0, 255, 0)
 	statusLabel.TextSize = 14
-	statusLabel.Font = Enum.Font.Courier
+	statusLabel.Font = Enum.Font.Gotham
 	statusLabel.TextWrapped = true
 	statusLabel.TextXAlignment = Enum.TextXAlignment.Left
 	statusLabel.TextYAlignment = Enum.TextYAlignment.Top
@@ -418,4 +418,4 @@ end)
 -- Cleanup
 game:BindToClose(function()
 	controller:stop()
-end)
+end) 
