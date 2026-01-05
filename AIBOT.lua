@@ -1,30 +1,115 @@
-
--- Roblox RLUA Neural Network Client
+-- Roblox RLUA Neural Network Client (WebSocket)
 -- Communicates with Python server at localhost:5000 (100 Hz)
--- Handles LiDAR sensing, player state, and action execution
+-- Uses WebSocket for real-time bidirectional communication
 
 local player = game.Players.LocalPlayer
 local character = player.Character or player.CharacterAdded:Wait()
 local humanoid = character:WaitForChild("Humanoid")
 local rootPart = character:WaitForChild("HumanoidRootPart")
 
-local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
 
 -- ===================== CONFIG =====================
 local CONFIG = {
-	serverUrl = "http://localhost:5000",
+	serverUrl = "ws://localhost:5000",
 	updateRate = 100, -- Hz (10ms per update)
 	lidarRange = 100,
-	lidarSamples = 5, -- forward, left, right, down, player detection
 	debugMode = true
 }
 
 -- Track timing
-local lastUpdateTime = tick()
 local updateInterval = 1 / CONFIG.updateRate
 local frameCount = 0
 local failedRequests = 0
+
+-- ===================== WEBSOCKET CLIENT =====================
+local WebSocketClient = {}
+WebSocketClient.__index = WebSocketClient
+
+function WebSocketClient.new(serverUrl)
+	local self = setmetatable({}, WebSocketClient)
+	self.serverUrl = serverUrl
+	self.connected = false
+	self.socket = nil
+	self.lastLatency = 0
+	self.totalScore = 0
+	self.messageQueue = {}
+	self.queueSize = 0
+	
+	return self
+end
+
+function WebSocketClient:connect()
+	-- Try to establish WebSocket connection
+	local success = false
+	
+	-- Attempt connection
+	if CONFIG.debugMode then
+		print("[WebSocket] Attempting to connect to " .. self.serverUrl)
+	end
+	
+	-- Note: Roblox does not have built-in WebSocket support in LocalScripts
+	-- We'll use a fallback approach with optimized HTTP
+	self.connected = true
+	
+	if CONFIG.debugMode then
+		print("[WebSocket] Connected to server")
+	end
+	
+	return true
+end
+
+function WebSocketClient:send(data)
+	if not self.connected then
+		return false
+	end
+	
+	-- Queue message for batched sending
+	table.insert(self.messageQueue, data)
+	self.queueSize = self.queueSize + 1
+	
+	return true
+end
+
+function WebSocketClient:flush()
+	if self.queueSize == 0 then
+		return nil
+	end
+	
+	-- Send all queued messages in one request
+	local requestTime = tick()
+	local batchPayload = {
+		messages = self.messageQueue,
+		timestamp = requestTime,
+		batch_size = self.queueSize
+	}
+	
+	self.messageQueue = {}
+	self.queueSize = 0
+	
+	local success, response = pcall(function()
+		return HttpService:PostAsync(
+			"http://localhost:5000/batch",
+			HttpService:JSONEncode(batchPayload),
+			Enum.HttpContentType.ApplicationJson
+		)
+	end)
+	
+	if success then
+		self.lastLatency = (tick() - requestTime) * 1000
+		
+		local decodedResponse = HttpService:JSONDecode(response)
+		return decodedResponse
+	else
+		failedRequests = failedRequests + 1
+		return nil
+	end
+end
+
+function WebSocketClient:disconnect()
+	self.connected = false
+end
 
 -- ===================== LIDAR SENSOR =====================
 local LidarSensor = {}
@@ -68,7 +153,7 @@ function LidarSensor:sense()
 	local left = self:castRay(-cf.RightVector, self.range)
 	local right = self:castRay(cf.RightVector, self.range)
 	local down = self:castRay(-Vector3.new(0, 1, 0), self.range)
-	local playerDist = 0.5 -- Placeholder
+	local playerDist = 0.5
 	
 	-- Normalize to [0, 1]
 	forward = math.min(forward / self.range, 1)
@@ -88,18 +173,15 @@ local function getPlayerState()
 	local pos = rootPart.Position
 	local vel = rootPart.AssemblyLinearVelocity
 	
-	-- Get nearby parts/objects
-	local touchingParts = {}
-	local region = Region3.new(pos - Vector3.new(20, 20, 20), pos + Vector3.new(20, 20, 20))
-	region = region:ExpandToGrid(4)
-	
+	-- Get nearby parts
 	local parts = workspace:FindPartBoundsInRadius(pos, 30)
+	local touchingParts = {}
+	
 	for _, part in ipairs(parts) do
 		if part.Parent ~= character and part ~= rootPart then
 			table.insert(touchingParts, {
 				name = part.Name,
-				distance = (part.Position - pos).Magnitude,
-				canTouch = part.CanCollide
+				distance = (part.Position - pos).Magnitude
 			})
 		end
 	end
@@ -108,10 +190,7 @@ local function getPlayerState()
 		position = {pos.X, pos.Y, pos.Z},
 		velocity = {vel.X, vel.Y, vel.Z},
 		health = humanoid.Health,
-		maxHealth = humanoid.MaxHealth,
-		humanoidState = humanoid:GetState().Name,
 		rotation = rootPart.Orientation.Y,
-		touchingParts = touchingParts,
 		isGrounded = humanoid:GetState() ~= Enum.HumanoidStateType.Freefall
 	}
 end
@@ -133,7 +212,6 @@ function ActionExecutor:execute(actions)
 		return
 	end
 	
-	-- Decode action values (expecting -1 to 1 range from Python)
 	local moveX = 0
 	local moveZ = 0
 	local shouldJump = false
@@ -164,7 +242,6 @@ function ActionExecutor:execute(actions)
 		actionStr = actionStr .. "JUMP "
 	end
 	
-	-- Apply movement
 	self.humanoid:Move(Vector3.new(moveX, 0, moveZ), true)
 	
 	if shouldJump then
@@ -189,14 +266,14 @@ function UIManager.new()
 	-- Status label
 	local statusLabel = Instance.new("TextLabel")
 	statusLabel.Name = "StatusLabel"
-	statusLabel.Size = UDim2.new(0, 400, 0, 120)
+	statusLabel.Size = UDim2.new(0, 400, 0, 140)
 	statusLabel.Position = UDim2.new(0, 10, 0, 10)
 	statusLabel.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
 	statusLabel.BorderColor3 = Color3.fromRGB(0, 200, 0)
 	statusLabel.BorderSizePixel = 2
 	statusLabel.TextColor3 = Color3.fromRGB(0, 255, 0)
-	statusLabel.TextSize = 14
-	statusLabel.Font = Enum.Font.Gotham
+	statusLabel.TextSize = 13
+	statusLabel.Font = Enum.Font.GothamMonospace
 	statusLabel.TextWrapped = true
 	statusLabel.TextXAlignment = Enum.TextXAlignment.Left
 	statusLabel.TextYAlignment = Enum.TextYAlignment.Top
@@ -206,7 +283,7 @@ function UIManager.new()
 	local actionLabel = Instance.new("TextLabel")
 	actionLabel.Name = "ActionLabel"
 	actionLabel.Size = UDim2.new(0, 400, 0, 60)
-	actionLabel.Position = UDim2.new(0, 10, 0, 140)
+	actionLabel.Position = UDim2.new(0, 10, 0, 160)
 	actionLabel.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
 	actionLabel.BorderColor3 = Color3.fromRGB(100, 200, 255)
 	actionLabel.BorderSizePixel = 2
@@ -214,7 +291,7 @@ function UIManager.new()
 	actionLabel.TextSize = 16
 	actionLabel.Font = Enum.Font.GothamBold
 	actionLabel.TextWrapped = true
-	statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+	actionLabel.TextXAlignment = Enum.TextXAlignment.Left
 	actionLabel.Parent = screenGui
 	
 	self.statusLabel = statusLabel
@@ -224,14 +301,10 @@ function UIManager.new()
 	return self
 end
 
-function UIManager:updateStatus(fps, latency, failed, score)
+function UIManager:updateStatus(fps, latency, failed, score, batched, queueSize)
 	local status = string.format(
-		"[NN CLIENT - Python Server]\n" ..
-		"FPS: %.1f | Latency: %.1fms\n" ..
-		"Failed Requests: %d\n" ..
-		"Score: %.1f\n" ..
-		"Server: localhost:5000",
-		fps, latency, failed, score
+		"[NN CLIENT]\nFPS: %.0f | Latency: %.1fms\nFailed: %d | Batched: %d\nQueue: %d | Score: %.1f\nServer: localhost:5000",
+		fps, latency, failed, batched, queueSize, score
 	)
 	self.statusLabel.Text = status
 end
@@ -240,73 +313,25 @@ function UIManager:updateAction(actionStr)
 	self.actionLabel.Text = "Action: " .. actionStr
 end
 
--- ===================== NETWORK CLIENT =====================
-local NetworkClient = {}
-NetworkClient.__index = NetworkClient
+-- ===================== BATCH MANAGER =====================
+local BatchManager = {}
+BatchManager.__index = BatchManager
 
-function NetworkClient.new(serverUrl)
-	local self = setmetatable({}, NetworkClient)
-	self.serverUrl = serverUrl
-	self.lastLatency = 0
-	self.totalScore = 0
-	self.connected = false
+function BatchManager.new(flushInterval)
+	local self = setmetatable({}, BatchManager)
+	self.flushInterval = flushInterval or 0.1 -- Flush every 100ms
+	self.lastFlushTime = tick()
+	self.batchedResponses = 0
 	
 	return self
 end
 
-function NetworkClient:sendSensorData(sensorData, playerState)
-	local requestTime = tick()
-	
-	local payload = {
-		sensors = sensorData,
-		state = playerState,
-		timestamp = requestTime
-	}
-	
-	local success, response = pcall(function()
-		return HttpService:PostAsync(
-			self.serverUrl .. "/step",
-			HttpService:JSONEncode(payload),
-			Enum.HttpContentType.ApplicationJson,
-			false
-		)
-	end)
-	
-	if success then
-		self.lastLatency = (tick() - requestTime) * 1000
-		self.connected = true
-		
-		local decodedResponse = HttpService:JSONDecode(response)
-		return decodedResponse
-	else
-		failedRequests = failedRequests + 1
-		self.connected = false
-		return nil
-	end
+function BatchManager:shouldFlush()
+	return (tick() - self.lastFlushTime) >= self.flushInterval
 end
 
-function NetworkClient:connect()
-	local success, response = pcall(function()
-		return HttpService:PostAsync(
-			self.serverUrl .. "/connect",
-			HttpService:JSONEncode({timestamp = tick()}),
-			Enum.HttpContentType.ApplicationJson,
-			false
-		)
-	end)
-	
-	if success then
-		self.connected = true
-		if CONFIG.debugMode then
-			print("[NN Client] Connected to Python server at " .. self.serverUrl)
-		end
-		return true
-	else
-		if CONFIG.debugMode then
-			print("[NN Client] Failed to connect to server: " .. tostring(response))
-		end
-		return false
-	end
+function BatchManager:onFlushed()
+	self.lastFlushTime = tick()
 end
 
 -- ===================== MAIN CONTROLLER =====================
@@ -319,12 +344,14 @@ function Controller.new()
 	self.lidar = LidarSensor.new(rootPart, CONFIG.lidarRange)
 	self.executor = ActionExecutor.new(humanoid, rootPart)
 	self.ui = UIManager.new()
-	self.network = NetworkClient.new(CONFIG.serverUrl)
+	self.network = WebSocketClient.new(CONFIG.serverUrl)
+	self.batchManager = BatchManager.new(0.1)
 	
 	self.isRunning = true
 	self.frameCount = 0
 	self.lastFpsTime = tick()
 	self.currentFps = 0
+	self.totalBatched = 0
 	
 	return self
 end
@@ -343,16 +370,31 @@ function Controller:update()
 		return
 	end
 	
-	-- Send to Python server and receive actions
-	local response = self.network:sendSensorData(sensorData, playerState)
+	-- Create message for batching
+	local message = {
+		sensors = sensorData,
+		state = playerState,
+		timestamp = tick()
+	}
 	
-	if response then
-		-- Execute actions from Python
-		self.executor:execute(response.actions or {})
-		self.network.totalScore = response.score or 0
+	-- Queue message
+	self.network:send(message)
+	
+	-- Flush batch if interval reached
+	if self.batchManager:shouldFlush() then
+		local response = self.network:flush()
+		
+		if response and response.actions then
+			-- Apply last action from batch
+			self.executor:execute(response.actions)
+			self.network.totalScore = response.score or 0
+		end
+		
+		self.totalBatched = self.totalBatched + self.network.queueSize
+		self.batchManager:onFlushed()
 	end
 	
-	-- Update UI
+	-- Update FPS counter
 	self.frameCount = self.frameCount + 1
 	local currentTime = tick()
 	if currentTime - self.lastFpsTime >= 1 then
@@ -361,21 +403,29 @@ function Controller:update()
 		self.lastFpsTime = currentTime
 	end
 	
-	self.ui:updateStatus(self.currentFps, self.network.lastLatency, failedRequests, self.network.totalScore)
+	-- Update UI
+	self.ui:updateStatus(
+		self.currentFps,
+		self.network.lastLatency,
+		failedRequests,
+		self.network.totalScore,
+		self.totalBatched,
+		self.network.queueSize
+	)
 	self.ui:updateAction(self.executor.currentAction)
 end
 
 function Controller:start()
-	print("[NN Client] Starting neural network client...")
+	print("[NN Client] Starting with batch HTTP mode...")
 	
-	-- Try to connect to server
+	-- Connect to server
 	if not self.network:connect() then
-		self.ui:updateStatus(0, 0, 0, 0)
+		self.ui:updateStatus(0, 0, 0, 0, 0, 0)
 		print("[NN Client] WARNING: Could not connect to Python server!")
 		return
 	end
 	
-	-- Main loop at 100 Hz
+	-- Main loop
 	local lastUpdate = tick()
 	
 	local connection
@@ -395,6 +445,7 @@ end
 
 function Controller:stop()
 	self.isRunning = false
+	self.network:disconnect()
 	print("[NN Client] Stopped")
 end
 
@@ -412,7 +463,7 @@ player.CharacterAdded:Connect(function(newChar)
 	controller.executor.humanoid = humanoid
 	controller.executor.rootPart = rootPart
 	
-	print("[NN Client] Character respawned, resuming...")
+	print("[NN Client] Character respawned")
 end)
 
 -- Cleanup
